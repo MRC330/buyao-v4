@@ -1,0 +1,67 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild \
+            -project BuYao.xcodeproj \
+            -target BuYao \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Verify app bundle
+        run: |
+          APP="build/DerivedData/Build/Products/Release-iphoneos/BuYao.app"
+          echo "App bundle: $APP"
+          ls -lh "$APP/BuYao"
+          file "$APP/BuYao" || true
+          echo "--- 资源检查 ---"
+          ls "$APP" | head -20
+          test -d "$APP/www" && echo "www 资源已打包 ✓" || echo "www 资源缺失 ✗"
+
+      - name: Package IPA
+        run: |
+          APP="build/DerivedData/Build/Products/Release-iphoneos/BuYao.app"
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          cd build
+          zip -qry BuYao.ipa Payload
+          ls -lh BuYao.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuYao-iOS-IPA
+          path: build/BuYao.ipa
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "## 补药 iOS 构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 产物：**BuYao-iOS-IPA**（本页下方 Artifacts 下载）" >> $GITHUB_STEP_SUMMARY
+          echo "- 类型：**未签名 IPA**，需用 Sideloadly / AltStore / Xcode 重签名后安装" >> $GITHUB_STEP_SUMMARY
+          echo "- 架构：arm64 (iPhone 真机)" >> $GITHUB_STEP_SUMMARY
