@@ -5,63 +5,268 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  build:
+  # ============================================================
+  # 主任务：构建未签名 IPA（无需任何证书，push 即可出包）
+  # ============================================================
+  build-unsigned:
+    name: 构建未签名 IPA
     runs-on: macos-latest
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Show environment
+      - name: 环境与工程诊断
         run: |
-          xcodebuild -version
+          echo "=== 系统 ==="
           sw_vers
+          echo "=== Xcode ==="
+          xcodebuild -version
+          echo "=== iOS SDK ==="
+          xcrun --sdk iphoneos --show-sdk-version
+          echo "=== 工程中的 target / scheme ==="
+          xcodebuild -list -project BuYao.xcodeproj || true
 
-      - name: Build app (unsigned)
+      # ----------------------------------------------------------
+      # 关键点：不要在 -target 模式下使用 -derivedDataPath。
+      # xcodebuild 要求 -derivedDataPath 必须配合 -scheme /
+      # -testProductsPath / -xctestrun 使用，否则直接报错退出。
+      # 这里改用 -scheme + archive（已提供共享 scheme），
+      # 并在异常时自动回退到 -target + build。
+      # ----------------------------------------------------------
+      - name: 归档 / 编译（未签名，真机 arm64）
         run: |
+          set -o pipefail
+          rm -rf build
+          mkdir -p build
+
+          COMMON_FLAGS=(
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_STYLE=Manual
+            PROVISIONING_PROFILE_SPECIFIER=""
+          )
+
+          echo ">>> 路线 1：scheme + archive"
           xcodebuild \
             -project BuYao.xcodeproj \
-            -target BuYao \
+            -scheme BuYao \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build/DerivedData \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            build
+            -archivePath "$PWD/build/BuYao.xcarchive" \
+            "${COMMON_FLAGS[@]}" \
+            archive 2>&1 | tee build/route1.log
+          RC1=${PIPESTATUS[0]}
 
-      - name: Verify app bundle
-        run: |
-          APP="build/DerivedData/Build/Products/Release-iphoneos/BuYao.app"
-          echo "App bundle: $APP"
-          ls -lh "$APP/BuYao"
-          file "$APP/BuYao" || true
-          echo "--- 资源检查 ---"
-          ls "$APP" | head -20
-          test -d "$APP/www" && echo "www 资源已打包 ✓" || echo "www 资源缺失 ✗"
+          if [ "$RC1" -ne 0 ]; then
+            echo "::warning::路线 1(scheme+archive) 失败，自动回退到路线 2(target+build)"
+            grep -E "error:|Error" build/route1.log | head -20 || true
 
-      - name: Package IPA
+            echo ">>> 路线 2：target + build"
+            xcodebuild \
+              -project BuYao.xcodeproj \
+              -target BuYao \
+              -configuration Release \
+              -sdk iphoneos \
+              SYMROOT="$PWD/build" \
+              OBJROOT="$PWD/build/obj" \
+              CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
+              "${COMMON_FLAGS[@]}" \
+              build 2>&1 | tee build/route2.log
+            RC2=${PIPESTATUS[0]}
+
+            if [ "$RC2" -ne 0 ]; then
+              echo "::error::两条构建路线均失败，错误摘要如下"
+              grep -E "error:|Swift Compiler Error|clang: error|ld: " build/route2.log | head -40 || true
+              exit 1
+            fi
+          fi
+
+      - name: 定位产物并校验
         run: |
-          APP="build/DerivedData/Build/Products/Release-iphoneos/BuYao.app"
+          set -euo pipefail
+          APP=""
+          for CANDIDATE in \
+            "$PWD/build/BuYao.xcarchive/Products/Applications/BuYao.app" \
+            "$PWD/build/Release-iphoneos/BuYao.app" \
+            "$PWD/build/DerivedData/Build/Products/Release-iphoneos/BuYao.app"
+          do
+            if [ -d "$CANDIDATE" ]; then APP="$CANDIDATE"; break; fi
+          done
+          # 兜底：全目录搜索
+          if [ -z "$APP" ]; then
+            APP=$(find "$PWD/build" -maxdepth 7 -type d -name "BuYao.app" | head -1 || true)
+          fi
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::未找到 BuYao.app，build 目录结构如下："
+            find "$PWD/build" -maxdepth 4 -type d | head -40 || true
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+          echo "应用路径: $APP"
+          echo ""
+
+          echo "=== Mach-O 架构 ==="
+          file "$APP/BuYao"
+          lipo -info "$APP/BuYao" 2>/dev/null || true
+
+          echo "=== 签名状态（未签名为预期行为）==="
+          codesign -dv "$APP" 2>&1 | head -3 || echo "未签名 ✓"
+
+          echo "=== H5 资源 ==="
+          if [ -d "$APP/www" ]; then
+            echo "www 资源已打包 ✓  大小: $(du -sh "$APP/www" | cut -f1)"
+            ls "$APP/www" | head -12
+            test -f "$APP/www/index.html" && echo "index.html 存在 ✓"
+          else
+            echo "::error::www 资源缺失，H5 内容不会出现在包内"
+            exit 1
+          fi
+
+          echo "=== 版本信息 ==="
+          /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP/Info.plist" 2>/dev/null || true
+
+      - name: 打包 IPA
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          rm -rf build/Payload
           mkdir -p build/Payload
-          cp -R "$APP" build/Payload/
-          cd build
-          zip -qry BuYao.ipa Payload
-          ls -lh BuYao.ipa
+          cp -R "$APP_PATH" build/Payload/
 
-      - name: Upload IPA
+          VER=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+                "build/Payload/BuYao.app/Info.plist" 2>/dev/null || echo "1.0")
+          IPA_NAME="BuYao-v${VER}-unsigned-b${{ github.run_number }}.ipa"
+
+          cd build
+          zip -qry "$IPA_NAME" Payload
+          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          echo "产出: $IPA_NAME"
+          ls -lh "$IPA_NAME"
+          echo "--- IPA 内容抽查 ---"
+          unzip -l "$IPA_NAME" | head -15
+
+      - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: BuYao-iOS-IPA
-          path: build/BuYao.ipa
+          name: BuYao-iOS-IPA-b${{ github.run_number }}
+          path: build/*.ipa
           if-no-files-found: error
+          retention-days: 30
 
-      - name: Summary
+      - name: 构建摘要
         run: |
-          echo "## 补药 iOS 构建完成" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- 产物：**BuYao-iOS-IPA**（本页下方 Artifacts 下载）" >> $GITHUB_STEP_SUMMARY
-          echo "- 类型：**未签名 IPA**，需用 Sideloadly / AltStore / Xcode 重签名后安装" >> $GITHUB_STEP_SUMMARY
-          echo "- 架构：arm64 (iPhone 真机)" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## 补药 iOS 构建完成"
+            echo ""
+            echo "- 产物：**${{ env.IPA_NAME }}**（本页下方 Artifacts 下载）"
+            echo "- 架构：arm64（iPhone 真机）"
+            echo "- 签名：**未签名**，需重签名后安装"
+            echo ""
+            echo "### 安装方式"
+            echo "1. [Sideloadly](https://sideloadly.io/)（Windows/Mac，免费 Apple ID 即可）"
+            echo "2. [AltStore](https://altstore.io/)"
+            echo "3. Mac 上用 Xcode → Devices and Simulators 拖入安装"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 可选任务：签名 IPA
+  # 默认关闭。在仓库 Settings → Secrets and variables 中配置后，
+  # 添加变量 ENABLE_SIGNING = true 即自动启用。
+  # ============================================================
+  build-signed:
+    name: 签名 IPA（需配置 Secrets）
+    runs-on: macos-latest
+    if: ${{ vars.ENABLE_SIGNING == 'true' }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 导入签名证书
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.SIGNING_CERT_P12 }}
+          p12-password: ${{ secrets.SIGNING_CERT_PASSWORD }}
+
+      - name: 安装描述文件
+        env:
+          PROFILE_B64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo -n "$PROFILE_B64" | base64 -d \
+            -o "$HOME/Library/MobileDevice/Provisioning Profiles/BuYao.mobileprovision"
+          echo "已安装描述文件:"
+          ls -lh "$HOME/Library/MobileDevice/Provisioning Profiles/"
+
+      - name: 生成导出配置
+        env:
+          TEAM_ID: ${{ vars.TEAM_ID }}
+          PROFILE_NAME: ${{ vars.PROVISIONING_PROFILE_NAME }}
+          METHOD: ${{ vars.EXPORT_METHOD || 'development' }}
+        run: |
+          cat > ExportOptions-CI.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${METHOD}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>compileBitcode</key><false/>
+            <key>stripSwiftSymbols</key><true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.medapp.buyao</key><string>${PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+          echo "导出配置:"; cat ExportOptions-CI.plist
+
+      - name: 归档并导出
+        env:
+          TEAM_ID: ${{ vars.TEAM_ID }}
+          PROFILE_NAME: ${{ vars.PROVISIONING_PROFILE_NAME }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project BuYao.xcodeproj \
+            -scheme BuYao \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$PWD/build/BuYao.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution: ${{ vars.CERT_COMMON_NAME }}" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            archive 2>&1 | tee build/sign-archive.log
+          RC=${PIPESTATUS[0]}
+          [ "$RC" -eq 0 ] || { grep -E "error:" build/sign-archive.log | head -30; exit 1; }
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$PWD/build/BuYao.xcarchive" \
+            -exportPath "$PWD/build/ipa" \
+            -exportOptionsPlist ExportOptions-CI.plist \
+            -allowProvisioningUpdates 2>&1 | tee build/sign-export.log
+
+      - name: 上传签名 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuYao-iOS-IPA-signed-b${{ github.run_number }}
+          path: build/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 30
